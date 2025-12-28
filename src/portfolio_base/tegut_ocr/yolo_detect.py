@@ -5,86 +5,105 @@ from PIL import Image
 import fitz
 import cv2
 import numpy as np
+from uuid import uuid4
 
-from portfolio_base.tegut_ocr.paths import (
-    PAGES_DIR,
-    DETECTIONS_DIR,
-    LABELS_DIR,
-    CROPS_DIR,
-    FILTERED_DIR,
-    YOLO_MODEL,
-)
+from portfolio_base.tegut_ocr.paths import DATA_DIR, YOLO_MODEL
 
 # ======================================================
 # 🧠 Public API
 # ======================================================
+def _cleanup_crops(crops_dir: Path):
+    for p in crops_dir.glob("*.jpg"):
+        p.unlink()
 
-def detect_products(pdf_path: Path, dpi: int = 450) -> list[Path]:
-    """
-    Runs YOLO detection on a flyer PDF and returns product crop paths.
 
-    Parameters
-    ----------
-    pdf_path : Path
-        Path to input flyer PDF
-    dpi : int
-        Rendering DPI for PDF → PNG
-
-    Returns
-    -------
-    list[Path]
-        Paths to cropped product images
-    """
-
+def detect_products(pdf_path: Path, dpi: int = 450):
     if not pdf_path.exists():
         raise FileNotFoundError(pdf_path)
 
-    kw = datetime.now().isocalendar()[1]
-    page_images = _pdf_to_images(pdf_path, dpi)
-    results = _run_yolo(page_images, kw)
-    crop_paths = _extract_crops(results)
-    _save_labels(results)
-    _apply_iou_filter(results)
+    # =========================================
+    # 🆕 Neuer isolierter Run
+    # =========================================
+    RUN_DIR = _create_run_dir(DATA_DIR)
 
-    return crop_paths
+    PAGES_DIR = RUN_DIR / "pages"
+    YOLO_DIR = RUN_DIR / "yolo"
+    CROPS_DIR = RUN_DIR / "crops"
+    LABELS_DIR = RUN_DIR / "labels"
+    FILTERED_DIR = RUN_DIR / "filtered"
+
+    for d in [
+        PAGES_DIR,
+        YOLO_DIR,
+        CROPS_DIR,
+        LABELS_DIR,
+        FILTERED_DIR,
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # =========================================
+    # Pipeline
+    # =========================================
+    page_images = _pdf_to_images(pdf_path, dpi, PAGES_DIR)
+    results = _run_yolo(page_images, YOLO_DIR)
+    crop_infos = _extract_crops(results, CROPS_DIR)
+
+    _save_labels(results, LABELS_DIR)
+    _apply_iou_filter(results, FILTERED_DIR)
+
+    return RUN_DIR, crop_infos
+
+
 
 
 # ======================================================
-# 🔧 Internals (private helpers)
+# 🔧 Internals
 # ======================================================
 
-def _pdf_to_images(pdf_path: Path, dpi: int) -> list[Path]:
+def _pdf_to_images(pdf_path: Path, dpi: int, pages_dir: Path) -> list[Path]:
     doc = fitz.open(pdf_path)
     pages = []
 
     for i, page in enumerate(doc, start=1):
         pix = page.get_pixmap(dpi=dpi)
-        out = PAGES_DIR / f"{pdf_path.stem}_page_{i:02d}.png"
+        out = pages_dir / f"{pdf_path.stem}_page_{i:02d}.png"
         pix.save(out)
         pages.append(out)
 
     doc.close()
     return pages
 
+def _create_run_dir(base_dir: Path) -> Path:
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_id = f"run_{ts}_{uuid4().hex[:6]}"
+    run_dir = base_dir / "output" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
-def _run_yolo(page_images: list[Path], kw: int):
+
+def _run_yolo(page_images: list[Path], yolo_dir: Path, min_conf: float = 0.8):
     model = YOLO(YOLO_MODEL)
 
-    results = model.predict(
+    return model.predict(
         source=[str(p) for p in page_images],
+        conf=0.8,          # ✅ HIER: filtert Boxen schon im YOLO Predict
         save=True,
         save_txt=True,
         save_conf=True,
-        project=str(DETECTIONS_DIR),
-        name=f"KW{kw:02d}_detect",
+        project=str(yolo_dir),
+        name="detect",
         exist_ok=True
     )
 
-    return results
 
 
-def _extract_crops(results) -> list[Path]:
-    crop_paths = []
+def _extract_crops(results, crops_dir: Path, min_conf: float = 0.8) -> list[dict]:
+    crop_infos = []
+
+    raw_dir = crops_dir / "raw"
+    ocr_dir = crops_dir / "ocr"
+    raw_dir.mkdir(exist_ok=True)
+    ocr_dir.mkdir(exist_ok=True)
 
     for result in results:
         img_path = Path(result.path)
@@ -92,47 +111,50 @@ def _extract_crops(results) -> list[Path]:
         img_np = np.array(img)
 
         for j, box in enumerate(result.boxes):
-            xyxy = box.xyxy[0].cpu().numpy().astype(int)
             conf = float(box.conf[0])
+
+            # =========================================
+            # ❌ CONFIDENCE-FILTER
+            # =========================================
+            if conf < min_conf:
+                continue
+
+            xyxy = box.xyxy[0].cpu().numpy().astype(int)
+            x1, y1, x2, y2 = map(int, xyxy)
             cls = int(box.cls[0])
 
-            crop = img_np[xyxy[1]:xyxy[3], xyxy[0]:xyxy[2]]
+            crop_raw = img_np[y1:y2, x1:x2]
+            crop_ocr = _remove_lines(crop_raw.copy())
 
-            crop = _remove_lines(crop)
+            base = f"{img_path.stem}_box{j+1:03d}_cls{cls}_conf{conf:.2f}"
 
-            name = f"{img_path.stem}_box{j+1:03d}_cls{cls}_conf{conf:.2f}.jpg"
-            out = CROPS_DIR / name
-            Image.fromarray(crop).save(out)
-            crop_paths.append(out)
+            raw_path = raw_dir / f"{base}.jpg"
+            ocr_path = ocr_dir / f"{base}.jpg"
 
-    return crop_paths
+            Image.fromarray(crop_raw).save(raw_path)
+            Image.fromarray(crop_ocr).save(ocr_path)
 
+            crop_infos.append({
+                "raw_path": raw_path,
+                "ocr_path": ocr_path,
+                "confidence": conf,
+                "bbox": (x1, y1, x2, y2),
+                "cls": cls,
+                "page": img_path.name
+            })
+
+    return crop_infos
 
 def _remove_lines(crop: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180,
-        threshold=80,
-        minLineLength=40,
-        maxLineGap=5
-    )
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(crop, (x1, y1), (x2, y2), (255, 255, 255), 2)
-
     return crop
 
-
-def _save_labels(results):
+def _save_labels(results, labels_dir: Path):
     for result in results:
         stem = Path(result.path).stem
-        result.save_txt(LABELS_DIR / f"{stem}.txt", save_conf=True)
+        result.save_txt(labels_dir / f"{stem}.txt", save_conf=True)
 
 
-def _apply_iou_filter(results, threshold: float = 0.9):
+def _apply_iou_filter(results, filtered_dir: Path, threshold: float = 0.9):
     def iou(a, b):
         xA, yA = max(a[0], b[0]), max(a[1], b[1])
         xB, yB = min(a[2], b[2]), min(a[3], b[3])
@@ -154,4 +176,4 @@ def _apply_iou_filter(results, threshold: float = 0.9):
         for x1, y1, x2, y2 in keep:
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        cv2.imwrite(str(FILTERED_DIR / Path(result.path).name), img)
+        cv2.imwrite(str(filtered_dir / Path(result.path).name), img)
